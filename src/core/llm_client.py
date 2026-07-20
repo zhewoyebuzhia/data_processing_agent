@@ -7,7 +7,7 @@ import time
 from typing import List, Dict, Optional, Any
 import requests
 
-from config.settings import API_BASE_URL, API_KEY, MODEL_CHAT
+from config.settings import API_BASE_URL, API_KEY, LOG_LLM_CONTENT_MAX_CHARS, MODEL_CHAT
 from src.utils.text_cleaner import TextCleaner
 
 
@@ -33,6 +33,26 @@ class LLMClient:
     def set_logger(self, logger):
         """设置日志记录器"""
         self.logger = logger
+
+    @staticmethod
+    def _truncate_for_log(content: str) -> str:
+        """Keep diagnostic logs useful without allowing one prompt to fill a disk."""
+        if len(content) <= LOG_LLM_CONTENT_MAX_CHARS:
+            return content
+        return f"{content[:LOG_LLM_CONTENT_MAX_CHARS]}\n...（日志内容已截断，原长度 {len(content)} 字符）"
+
+    def _log_messages(self, messages: List[Dict[str, str]]) -> None:
+        """Write the actual LLM work context to the file logger at DEBUG level."""
+        if not self.logger:
+            return
+        formatted = []
+        for index, message in enumerate(messages, start=1):
+            content = message.get("content", "")
+            formatted.append(
+                f"[{index}] role={message.get('role', 'unknown')}\n"
+                f"{self._truncate_for_log(str(content))}"
+            )
+        self.logger.debug("📤 LLM 请求消息（清理前语义内容）：\n%s", "\n\n".join(formatted))
     
     def call_llm(self, messages: List[Dict[str, str]], temperature: float = 0.1, 
                  max_tokens: int = None, attempt: int = 1) -> Dict:
@@ -56,6 +76,8 @@ class LLMClient:
                 "content": self.text_cleaner.clean_text(msg["content"]) if isinstance(msg["content"], str) else msg["content"]
             }
             cleaned_messages.append(cleaned_msg)
+
+        self._log_messages(cleaned_messages)
         
         # 自动判断 max_tokens
         if max_tokens is None:
@@ -91,7 +113,19 @@ class LLMClient:
                 self.logger.debug(f"📤 API请求: max_tokens={max_tokens}, timeout={timeout}s, 尝试={attempt}")
             response = requests.post(url, headers=headers, json=payload, timeout=timeout)
             response.raise_for_status()
-            return response.json()
+            result = response.json()
+            if self.logger:
+                try:
+                    choice = result["choices"][0]
+                    content = choice["message"]["content"]
+                    self.logger.debug(
+                        "📥 LLM 响应（finish_reason=%s）：\n%s",
+                        choice.get("finish_reason"),
+                        self._truncate_for_log(str(content)),
+                    )
+                except (KeyError, IndexError, TypeError):
+                    self.logger.debug("📥 LLM 响应（非标准格式）：%s", self._truncate_for_log(str(result)))
+            return result
             
         except requests.exceptions.Timeout as e:
             if attempt < self.max_retries:

@@ -6,7 +6,7 @@ from typing import Dict, List, Optional
 import ast
 import re
 
-from config.settings import MAX_PROCESSING_ITERATIONS
+from config.settings import CODE_GENERATION_MAX_TOKENS, MAX_PROCESSING_ITERATIONS
 
 
 class ProcessingHandler:
@@ -183,7 +183,7 @@ print(f"✅ 结果已保存至: {{output_file}}")
         device_name = self._detect_device(user_input)
         
         # 构建消息
-        messages = [
+        base_messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "system", "content": f"当前可用工具：\n{self.tool_scanner.get_description()}"},
             {"role": "system", "content": f"""
@@ -214,9 +214,22 @@ print(f"✅ 结果已保存至: {{output_file}}")
         last_error = None
         saved_tool_path = None
         no_write_warning_count = 0  # 记录连续无写入操作的次数
+        retry_messages = []
+
+        def schedule_retry(feedback: str, previous_reply: Optional[str] = None) -> None:
+            """Keep only one bounded retry context instead of growing it each round."""
+            retry_messages.clear()
+            if previous_reply:
+                retry_messages.append({
+                    "role": "assistant",
+                    "content": previous_reply[:6000],
+                })
+            retry_messages.append({"role": "user", "content": feedback[:3000]})
         
         while iteration < max_iterations:
             iteration += 1
+            # 每轮从固定基础上下文重建，避免“失败代码 + 错误信息”无限累积。
+            messages = list(base_messages) + list(retry_messages)
             if self.logger:
                 self.logger.info(f"\n{'='*50}")
                 self.logger.info(f"🔄 第 {iteration}/{max_iterations} 次尝试")
@@ -241,7 +254,11 @@ print(f"✅ 结果已保存至: {{output_file}}")
                 messages.append({"role": "user", "content": strong_feedback})
             
             # 调用LLM
-            result = self.llm_client.call_llm(messages, temperature=0.1)
+            result = self.llm_client.call_llm(
+                messages,
+                temperature=0.1,
+                max_tokens=CODE_GENERATION_MAX_TOKENS,
+            )
             
             if "error" in result:
                 error_msg = f"❌ LLM 调用失败: {result['error']}"
@@ -250,7 +267,8 @@ print(f"✅ 结果已保存至: {{output_file}}")
                 return error_msg
             
             try:
-                assistant_reply = result["choices"][0]["message"]["content"]
+                choice = result["choices"][0]
+                assistant_reply = choice["message"]["content"]
                 assistant_reply = self.text_cleaner.clean_text(assistant_reply)
                 if self.logger:
                     self.logger.info(f"📝 LLM 回复:\n{assistant_reply[:500]}...")
@@ -259,6 +277,18 @@ print(f"✅ 结果已保存至: {{output_file}}")
                 if self.logger:
                     self.logger.error(error_msg)
                 return error_msg
+
+            # finish_reason=length means the reply is incomplete.  Do not send
+            # the partial script to the syntax checker or retain it in context.
+            if choice.get("finish_reason") == "length":
+                last_error = "模型输出达到长度上限，代码不完整"
+                if self.logger:
+                    self.logger.warning(f"⚠️ {last_error}，将以更精简的要求重新生成")
+                schedule_retry(
+                    "上一轮代码因输出长度被截断。请从头重新输出一份更精简、完整、可运行的 "
+                    "Python 脚本；不要解释。必须闭合所有括号、引号和 ``` 代码块。"
+                )
+                continue
             
             # 提取代码
             code = self.code_parser.extract_code(assistant_reply)
@@ -272,8 +302,7 @@ print(f"✅ 结果已保存至: {{output_file}}")
                     if self.logger:
                         self.logger.warning("⚠️ 数据处理任务中检测到 Bash，强制纠正")
                     force_msg = "⚠️ 数据处理任务必须使用 Python，不要用 Bash。请重新生成 Python 代码。"
-                    messages.append({"role": "assistant", "content": assistant_reply})
-                    messages.append({"role": "user", "content": force_msg})
+                    schedule_retry(force_msg, assistant_reply)
                     continue
                 
                 # 🔥 执行前：检查是否有写入操作
@@ -295,8 +324,7 @@ print(f"✅ 结果已保存至: {{output_file}}")
 {write_template}
 
 请修改代码后重试。"""
-                        messages.append({"role": "assistant", "content": assistant_reply})
-                        messages.append({"role": "user", "content": feedback})
+                        schedule_retry(feedback, assistant_reply)
                         continue
                     else:
                         # 多次无写入，直接返回失败，避免无限循环
@@ -324,13 +352,12 @@ print(f"✅ 结果已保存至: {{output_file}}")
                         self.logger.error(f"❌ 语法检查失败:\n{syntax_error}")
                     last_code = code
                     last_error = syntax_error
-                    messages.append({"role": "assistant", "content": assistant_reply})
                     error_feedback = f"""代码存在语法错误，请修复后重试：
 
 {syntax_error}
 
 提示：请仔细检查括号、引号、冒号是否匹配，确保所有代码块完整闭合。"""
-                    messages.append({"role": "user", "content": error_feedback})
+                    schedule_retry(error_feedback, assistant_reply)
                     continue
                 
                 # 执行 Python 代码
@@ -358,8 +385,7 @@ print(f"✅ 结果已保存至: {{output_file}}")
 {write_template}
 
 请修改代码后重试。"""
-                        messages.append({"role": "assistant", "content": assistant_reply})
-                        messages.append({"role": "user", "content": feedback})
+                        schedule_retry(feedback, assistant_reply)
                         continue
                     
                     # 检查是否有文件生成
@@ -382,8 +408,7 @@ print(f"✅ 结果已保存至: {{output_file}}")
 {write_template}
 
 请修改代码后重试。"""
-                            messages.append({"role": "assistant", "content": assistant_reply})
-                            messages.append({"role": "user", "content": feedback})
+                            schedule_retry(feedback, assistant_reply)
                             continue
                     
                     # 保存工具（如果包含函数或类定义）
@@ -416,14 +441,16 @@ print(f"✅ 结果已保存至: {{output_file}}")
                             self.logger.info(f"📊 需要优化: {reason}")
                         last_code = code
                         last_error = f"执行结果不满意: {reason}"
-                        messages.append({"role": "assistant", "content": assistant_reply})
-                        messages.append({"role": "user", "content": f"执行成功，但需要优化。原因：{reason}\n\n请修改代码，确保生成正确的输出文件并提供详细的统计信息。"})
+                        schedule_retry(
+                            f"执行成功，但需要优化。原因：{reason}\n\n"
+                            "请修改代码，确保生成正确的输出文件并提供详细的统计信息。",
+                            assistant_reply,
+                        )
                 else:
                     if self.logger:
                         self.logger.error(f"❌ 执行失败:\n{output}")
                     last_code = code
                     last_error = output
-                    messages.append({"role": "assistant", "content": assistant_reply})
                     # 提供更详细的错误信息，帮助 LLM 修复
                     error_feedback = f"""代码执行失败，错误信息：
 {output}
@@ -435,7 +462,7 @@ print(f"✅ 结果已保存至: {{output_file}}")
 4. 读取的文件是否存在
 5. 数据加载后是否为空（打印 len(data) 确认）
 6. 是否包含了正确的写入操作（open().write() 或 json.dump()）"""
-                    messages.append({"role": "user", "content": error_feedback})
+                    schedule_retry(error_feedback, assistant_reply)
             else:
                 # 没有代码块
                 if self.logger:
@@ -448,8 +475,7 @@ print(f"✅ 结果已保存至: {{output_file}}")
 ║  必须包含：读取 → 处理 → 写入 → 打印统计                   ║
 ╚══════════════════════════════════════════════════════════════╝
 """
-                messages.append({"role": "assistant", "content": assistant_reply})
-                messages.append({"role": "user", "content": force_msg})
+                schedule_retry(force_msg, assistant_reply)
                 continue
         
         # 超过迭代次数

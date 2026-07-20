@@ -1,0 +1,9 @@
+[
+  {
+    "name": "laptop_1_collect_battery",
+    "tool_path": "tools/laptop_1/collect_battery.py",
+    "device": "laptop_1",
+    "interval_seconds": 30,
+    "enabled": true
+  }
+]

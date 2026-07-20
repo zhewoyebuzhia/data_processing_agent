@@ -34,3 +34,8 @@ LOG_LEVEL = "INFO"                      # DEBUG / INFO / WARNING / ERROR
 
 # 处理任务配置
 MAX_PROCESSING_ITERATIONS = int(os.getenv("MAX_PROCESSING_ITERATIONS", "10"))
+# 生成完整数据处理脚本通常需要显著多于普通对话的输出长度。
+CODE_GENERATION_MAX_TOKENS = int(os.getenv("CODE_GENERATION_MAX_TOKENS", "8192"))
+
+# 日志内容配置：完整 LLM 请求/回复写入文件日志的 DEBUG 级别，超长内容保留前 N 个字符。
+LOG_LLM_CONTENT_MAX_CHARS = int(os.getenv("LOG_LLM_CONTENT_MAX_CHARS", "20000"))

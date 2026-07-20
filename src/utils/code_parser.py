@@ -27,6 +27,12 @@ class CodeParser:
         Returns:
             提取的代码，如果是 Bash 则返回 "__BASH__:命令"
         """
+        # A markdown code block without a closing fence is normally an output
+        # truncated by the model.  Do not execute its partial contents.
+        if re.search(r'```(?:python)?(?:\s*\n|\s)', text, re.IGNORECASE):
+            if text.count('```') % 2 != 0:
+                return None
+
         # 1. 优先检查 Python 代码块
         patterns = [
             r'```python\s*\n(.*?)```',  # 标准格式

@@ -21,9 +21,11 @@ from src.core.code_executor import CodeExecutor
 from src.core.context_manager import ContextManager
 from src.core.tool_scanner import ToolScanner
 from src.core.tool_saver import ToolSaver
+from src.core.collection_scheduler import CollectionScheduler
 from src.handlers.chat_handler import ChatHandler
 from src.handlers.exploration_handler import ExplorationHandler
 from src.handlers.processing_handler import ProcessingHandler
+from src.handlers.collection_handler import CollectionHandler
 from src.utils.text_cleaner import TextCleaner
 from src.utils.code_parser import CodeParser
 from src.utils.result_validator import ResultValidator
@@ -57,7 +59,9 @@ class AgentRunner:
     def _setup_logger(self) -> logging.Logger:
         """设置日志：同时输出到命令行和文件"""
         logger = logging.getLogger("AgentRunner")
-        logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+        # Keep the logger at DEBUG so the file handler receives full LLM traces.
+        # The console handler below still follows LOG_LEVEL and remains readable.
+        logger.setLevel(logging.DEBUG)
         
         # 避免重复添加 handler
         if logger.handlers:
@@ -71,7 +75,7 @@ class AgentRunner:
         
         # 命令行 handler
         console = logging.StreamHandler(sys.stdout)
-        console.setLevel(logging.INFO)
+        console.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
         console.setFormatter(formatter)
         logger.addHandler(console)
         
@@ -109,6 +113,9 @@ class AgentRunner:
         
         self.tool_saver = ToolSaver()
         self.tool_saver.set_logger(self.logger)
+
+        self.collection_scheduler = CollectionScheduler()
+        self.collection_scheduler.set_logger(self.logger)
         
         # 3. Handlers
         self.chat_handler = ChatHandler(
@@ -129,6 +136,13 @@ class AgentRunner:
         )
         self.processing_handler.set_logger(self.logger)
         self.processing_handler.set_system_prompt(self.system_prompt)
+
+        self.collection_handler = CollectionHandler(
+            self.llm_client, self.code_executor, self.context_manager,
+            self.tool_scanner, self.tool_saver, self.text_cleaner,
+            self.code_parser, self.collection_scheduler,
+        )
+        self.collection_handler.set_logger(self.logger)
     
     def _get_tools_description(self) -> str:
         """生成工具列表描述"""
@@ -140,6 +154,7 @@ class AgentRunner:
         
         Returns:
             'processing': 数据处理任务
+            'collection': 创建或配置定时数据采集工具
             'exploration': 探索类任务
             'chat': 闲聊
         """
@@ -147,8 +162,9 @@ class AgentRunner:
         messages = [
             {"role": "system", "content": """你是一个任务分类器。根据用户输入，判断用户想要做什么。
 
-请只输出以下三种类型之一：
-- processing: 用户想要处理、分析、转换数据，或者要求生成代码、创建工具
+请只输出以下四种类型之一：
+- collection: 用户要求采集、监测、记录设备/传感器/电脑/手机/手表/家居数据，尤其是按固定间隔持续收集
+- processing: 用户想要处理、分析、转换已有数据，或者要求生成处理工具
 - exploration: 用户想要查看、列出、浏览、检查文件或目录
 - chat: 用户想要闲聊、提问、打招呼
 
@@ -166,7 +182,9 @@ class AgentRunner:
             reply = result["choices"][0]["message"]["content"].strip().lower()
             self.logger.info(f"📊 LLM 分类结果: {reply}")
             
-            if "exploration" in reply:
+            if "collection" in reply:
+                return "collection"
+            elif "exploration" in reply:
                 return "exploration"
             elif "chat" in reply:
                 return "chat"
@@ -190,16 +208,23 @@ class AgentRunner:
         # 清理输入
         cleaned_input = self.text_cleaner.clean_text(user_input)
         cleaned_input = self.text_cleaner.truncate_large_input(cleaned_input, max_chars=8000)
+        self.logger.info("👤 用户输入：\n%s", cleaned_input)
         
         # 让 LLM 判断意图
         task_type = self._classify_with_llm(cleaned_input)
         
         if task_type == "processing":
-            return self.processing_handler.handle(cleaned_input, max_iterations)
+            response = self.processing_handler.handle(cleaned_input, max_iterations)
+        elif task_type == "collection":
+            response = self.collection_handler.handle(cleaned_input)
         elif task_type == "exploration":
-            return self.exploration_handler.handle(cleaned_input)
+            response = self.exploration_handler.handle(cleaned_input)
         else:
-            return self.chat_handler.handle(cleaned_input)
+            response = self.chat_handler.handle(cleaned_input)
+
+        self.logger.info("🤖 最终返回：\n%s", response)
+        return response
+
     
     def run(self):
         """启动交互式对话"""
